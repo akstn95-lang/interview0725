@@ -463,6 +463,30 @@
       border-radius: 5px;
     }
     .step-dot.completed { background: var(--success); }
+    .camera-box {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 500;
+      text-align: center;
+      background: white;
+      padding: 8px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+    }
+    .camera-box video {
+      width: 160px;
+      height: 120px;
+      border-radius: 8px;
+      object-fit: cover;
+      background: #111827;
+      display: block;
+    }
+    .camera-box .camera-caption {
+      font-size: 11px;
+      color: var(--gray-600);
+      margin-top: 4px;
+    }
     @media (max-width: 600px) {
       .card { padding: 20px; }
       h1 { font-size: 22px; }
@@ -481,6 +505,12 @@
   </div>
   <!-- 토스트 메시지 -->
   <div id="toast" class="toast"></div>
+  <!-- 면접 태도 분석용 카메라 미리보기 (스냅샷은 분석 후 즉시 폐기, 저장하지 않음) -->
+  <div id="cameraBox" class="camera-box hidden">
+    <video id="cameraVideo" autoplay muted playsinline></video>
+    <div class="camera-caption">🎥 태도 분석용 (저장 안 됨)</div>
+  </div>
+  <canvas id="captureCanvas" width="320" height="240" class="hidden"></canvas>
   <div class="container">
 
     <!-- ============ STEP 0: 학번/이름 입력 ============ -->
@@ -581,6 +611,13 @@
           </div>
         </div>
         <div class="setting-row">
+          <div class="setting-label">카메라 면접 태도 분석 (선택)</div>
+          <div class="setting-control">
+            <input type="checkbox" id="cameraEnabledCheckbox" style="width:20px;height:20px;">
+          </div>
+        </div>
+        <p class="voice-preview" style="margin-bottom:8px;">켜면 답변 중 웹캠 스냅샷을 캡처해 시선처리·자세·표정 피드백을 추가로 받습니다. 이미지는 분석 후 즉시 폐기되며 저장되지 않습니다.</p>
+        <div class="setting-row">
           <div class="setting-label">질문 개수</div>
           <div class="setting-control">
             <input type="range" id="questionCount" min="1" max="20" value="5" oninput="updateCountLabel(this.value)">
@@ -670,6 +707,10 @@
           <div class="feedback-item hidden" id="fbCompetencyWrap">
             <div class="feedback-label" style="color:#6d28d9;">🧭 확인된 핵심역량</div>
             <div class="feedback-content" id="fbCompetency"></div>
+          </div>
+          <div class="feedback-item hidden" id="fbAttitudeWrap">
+            <div class="feedback-label" style="color:#0891b2;">🎥 면접 태도 (시선·자세·표정)</div>
+            <div class="feedback-content" id="fbAttitude" style="background:#ecfeff; padding:12px; border-radius:8px; border-left:3px solid #06b6d4;"></div>
           </div>
         </div>
         <div class="btn-group" id="actionButtons">
@@ -767,6 +808,7 @@
           questionCount: appState.questionCount,
           difficulty: appState.difficulty,
           careerField: appState.careerField,
+          cameraEnabled: appState.cameraEnabled,
           questions: appState.questions,
           answers: appState.answers,
           currentIndex: appState.currentIndex,
@@ -802,6 +844,7 @@
       questionCount: 5,
       difficulty: '중',
       careerField: '인문/사회계열',
+      cameraEnabled: false,
       questions: [],
       answers: [],
       currentIndex: 0,
@@ -817,6 +860,72 @@
     };
     // PDF.js 설정
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    // ==========================================
+    // 카메라 면접 태도 분석 (opt-in)
+    // - 답변 도중 웹캠 스냅샷을 주기적으로 캡처했다가, 답변 제출 시 최대 3장을
+    //   피드백 요청에 함께 실어 보냅니다. 이미지는 여기(브라우저)와 서버 어디에도
+    //   저장하지 않고, 분석 응답을 받는 즉시 배열을 비웁니다.
+    // ==========================================
+    let cameraStream = null;
+    let attitudeSnapshots = [];
+    let snapshotIntervalId = null;
+
+    function initCamera() {
+      if (!appState.cameraEnabled || cameraStream) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showToast('이 브라우저는 카메라 접근을 지원하지 않습니다.');
+        appState.cameraEnabled = false;
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false })
+        .then(function(stream) {
+          cameraStream = stream;
+          const video = document.getElementById('cameraVideo');
+          video.srcObject = stream;
+          document.getElementById('cameraBox').classList.remove('hidden');
+        })
+        .catch(function(err) {
+          console.error('카메라 접근 실패:', err);
+          showToast('카메라 접근이 거부되어 태도 분석 없이 진행합니다.');
+          appState.cameraEnabled = false;
+        });
+    }
+    function stopCamera() {
+      if (snapshotIntervalId) {
+        clearInterval(snapshotIntervalId);
+        snapshotIntervalId = null;
+      }
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+        cameraStream = null;
+      }
+      document.getElementById('cameraBox').classList.add('hidden');
+      attitudeSnapshots = [];
+    }
+    function captureSnapshot() {
+      if (!cameraStream) return;
+      try {
+        const video = document.getElementById('cameraVideo');
+        const canvas = document.getElementById('captureCanvas');
+        if (!video.videoWidth) return; // 아직 스트림 준비 전
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+        attitudeSnapshots.push(dataUrl);
+        if (attitudeSnapshots.length > 3) attitudeSnapshots.shift();
+      } catch (e) {
+        console.warn('스냅샷 캡처 실패:', e);
+      }
+    }
+    function startSnapshotCapture() {
+      attitudeSnapshots = [];
+      if (snapshotIntervalId) clearInterval(snapshotIntervalId);
+      if (!appState.cameraEnabled || !cameraStream) return;
+      // 첫 스냅샷은 잠시 후, 이후 약 7초 간격으로 캡처 (질문당 최대 3장 유지)
+      setTimeout(captureSnapshot, 2000);
+      snapshotIntervalId = setInterval(captureSnapshot, 7000);
+    }
 
     // 설정 상태 확인 (API 키 / 스프레드시트 미설정 시 안내)
     callBackend('checkSetup', {}).then(function(status) {
@@ -860,6 +969,7 @@
       appState.questionCount = saved.questionCount || 5;
       appState.difficulty = saved.difficulty || '중';
       appState.careerField = saved.careerField || '인문/사회계열';
+      appState.cameraEnabled = !!saved.cameraEnabled;
       appState.questions = saved.questions || [];
       appState.answers = saved.answers || [];
       appState.currentIndex = saved.currentIndex || 0;
@@ -871,6 +981,7 @@
       document.getElementById('sourceText').value = appState.sourceText;
       document.getElementById('careerFieldSelect').value = appState.careerField;
       document.getElementById('difficultySelect').value = appState.difficulty;
+      document.getElementById('cameraEnabledCheckbox').checked = appState.cameraEnabled;
       document.getElementById('questionCount').value = appState.questionCount;
       updateCountLabel(appState.questionCount);
 
@@ -880,6 +991,7 @@
         renderResults();
       } else if (step === 3 && appState.questions.length) {
         showStep(3);
+        initCamera();
         renderQuestion();
       } else if (step === 2) {
         showStep(2);
@@ -1039,6 +1151,7 @@
       appState.voiceRate = parseFloat(document.getElementById('voiceRate').value);
       appState.difficulty = document.getElementById('difficultySelect').value;
       appState.careerField = document.getElementById('careerFieldSelect').value;
+      appState.cameraEnabled = document.getElementById('cameraEnabledCheckbox').checked;
 
       const startBtn = document.getElementById('startBtn');
       startBtn.disabled = true;
@@ -1060,6 +1173,7 @@
           appState.answers = [];
           appState.currentIndex = 0;
           showStep(3);
+          initCamera();
           renderQuestion();
         }).catch(function(err) {
           setLoading(false);
@@ -1084,11 +1198,13 @@
       document.getElementById('feedbackBox').classList.add('hidden');
       document.getElementById('fbProbingWrap').classList.add('hidden');
       document.getElementById('fbCompetencyWrap').classList.add('hidden');
+      document.getElementById('fbAttitudeWrap').classList.add('hidden');
       document.getElementById('submitAnswerBtn').classList.remove('hidden');
       document.getElementById('nextQuestionBtn').classList.add('hidden');
       document.getElementById('finishBtn').classList.add('hidden');
       document.getElementById('recordSection').classList.remove('hidden');
       if (appState.isRecording) stopRecording();
+      startSnapshotCapture();
       // 자동 음성 출력
       setTimeout(() => speakQuestion(), 500);
     }
@@ -1178,16 +1294,21 @@
         return;
       }
       if (appState.isRecording) stopRecording();
+      if (snapshotIntervalId) { clearInterval(snapshotIntervalId); snapshotIntervalId = null; }
+      if (appState.cameraEnabled && cameraStream) captureSnapshot(); // 제출 시점 스냅샷 1장 추가 확보
       const question = appState.questions[appState.currentIndex];
-      setLoading(true, 'Claude AI가 답변을 분석하는 중...');
+      const snapshotsToSend = attitudeSnapshots.slice();
+      setLoading(true, snapshotsToSend.length ? 'Claude AI가 답변과 면접 태도를 분석하는 중...' : 'Claude AI가 답변을 분석하는 중...');
       callBackend('generateAnswerFeedback', {
         question: question,
         answer: answer,
         sourceText: appState.sourceText,
         difficulty: appState.difficulty,
-        careerField: appState.careerField
+        careerField: appState.careerField,
+        attitudeSnapshots: snapshotsToSend
       }).then(function(res) {
           setLoading(false);
+          attitudeSnapshots = []; // 분석 요청이 끝났으므로 즉시 폐기 (저장하지 않음)
           if (!res.success) {
             showToast(res.error || '피드백 생성 실패');
             return;
@@ -1214,6 +1335,14 @@
                 `<span class="tag">${escapeHtml(c.trim())}</span>`).join('');
             document.getElementById('fbCompetencyWrap').classList.remove('hidden');
           }
+          if (res.feedback.attitudeOverall) {
+            document.getElementById('fbAttitude').innerHTML =
+              `시선: ${escapeHtml(res.feedback.attitudeEyeContact || '-')}<br>` +
+              `자세: ${escapeHtml(res.feedback.attitudePosture || '-')}<br>` +
+              `표정: ${escapeHtml(res.feedback.attitudeExpression || '-')}<br>` +
+              escapeHtml(res.feedback.attitudeOverall);
+            document.getElementById('fbAttitudeWrap').classList.remove('hidden');
+          }
           document.getElementById('feedbackBox').classList.remove('hidden');
           // 버튼 상태 변경
           document.getElementById('submitAnswerBtn').classList.add('hidden');
@@ -1227,6 +1356,7 @@
           speakText('피드백이 생성되었습니다. 확인 후 다음 단계를 진행해주세요.');
         }).catch(function(err) {
           setLoading(false);
+          attitudeSnapshots = []; // 실패 시에도 폐기
           showToast('오류: ' + err.message);
         });
     }
@@ -1237,6 +1367,7 @@
     }
     function finishInterview() {
       if (appState.isRecording) stopRecording();
+      stopCamera();
       showStep(4);
       renderResults();
     }
@@ -1257,6 +1388,7 @@
             </div>
             <div style="font-size:13px; color:#059669;"><strong>✅</strong> ${escapeHtml(feedback.strengths)}</div>
             ${feedback.competencyFocus ? `<div style="margin-top:8px;">${String(feedback.competencyFocus).split(',').map(c => `<span class="tag">${escapeHtml(c.trim())}</span>`).join('')}</div>` : ''}
+            ${feedback.attitudeOverall ? `<div style="margin-top:8px; background:#ecfeff; padding:10px; border-radius:8px; border-left:3px solid #06b6d4; font-size:13px;">🎥 ${escapeHtml(feedback.attitudeOverall)}</div>` : ''}
           </div>
         `;
       });
@@ -1342,9 +1474,11 @@
         });
     }
     function goToWaitingRoom() {
+      stopCamera();
       showStep('waiting');
     }
     function resetAndStart() {
+      stopCamera();
       const keepId = appState.studentId;
       const keepName = appState.studentName;
       clearPersistedState();
@@ -1355,6 +1489,7 @@
         questionCount: 5,
         difficulty: '중',
         careerField: '인문/사회계열',
+        cameraEnabled: false,
         questions: [],
         answers: [],
         currentIndex: 0,
@@ -1371,6 +1506,7 @@
       document.getElementById('sourceText').value = '';
       document.getElementById('pdfFile').value = '';
       document.getElementById('fileName').textContent = '';
+      document.getElementById('cameraEnabledCheckbox').checked = false;
       showStep(1);
     }
     // 키보드 단축키
